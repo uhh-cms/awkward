@@ -3462,11 +3462,16 @@ class _LazyDatasetGenerator:
 
 
 class _Dataset:
-    def __init__(self, schema, row_groups, columns, partition_columns):
+    def __init__(self, schema, row_groups, columns, partition_columns, column_paths=None):
         self.schema = schema
         self.row_groups = row_groups
+        self.__column_toplevel_names = []
+        self.__column_paths = []
         self.columns = columns
+        if isinstance(column_paths, list):
+            self.column_paths = column_paths
         self.partition_columns = partition_columns
+        self.__lookup = dict()
 
     @property
     def is_empty(self):
@@ -3489,6 +3494,163 @@ class _Dataset:
 
         return batches
 
+    @property
+    def columns(self):
+        """
+        getter for top-level field names in parquet files
+        """
+        return self.__column_toplevel_names
+
+    @columns.setter
+    def columns(self, columns):
+        """
+        setter for top-level field names in parquet files. If the list
+        *column_paths* is a :py:class:`list` of :py:type:`str`, the elements
+        are the names. If it is a :py:class:`list` of an iterable of 
+        :py:type:`str`, the top-level fields are the first elements of the 
+        iterable.
+        """
+        # loop through the elements to determine the type
+        field_names = []
+        try:
+            for s in columns:
+                tmp_name = None
+                if isinstance(s, str):
+                    tmp_name = s
+                elif getattr(s, "__iter__"):
+                    tmp_name = s[0]
+                else:
+                    raise TypeError("Could not determine top-level field names")
+                field_names.append(str(tmp_name))
+        except:
+            raise TypeError("Could not determine top-level field names")
+        self.__column_toplevel_names = field_names
+
+    @property
+    def column_paths(self):
+        """
+        getter for the column paths used to load columns from parquet files
+        """
+        return self.__column_paths
+
+    @column_paths.setter
+    def column_paths(self, column_paths):
+        """
+        setter for the column paths. Input *column_paths* is the list of
+        the column names used in the parquet file.
+        """
+        try:
+            if (getattr(column_paths, "__iter__") and 
+                all(isinstance(x, str) for x in column_paths)):
+                self.__column_paths = list(column_paths)
+        except:
+            msg = f"Unable to build list of column paths from type '{type(column_paths)}'"
+            raise TypeError(msg)
+
+    @property
+    def column_lookup(self):
+        return self.__lookup
+
+    @column_lookup.setter
+    def column_lookup(self, input_dict):
+        if not isinstance(input_dict, dict):
+            raise ValueError("column lookup table must be a dict!")
+        self.__lookup = input_dict
+
+    def _create_column_path_lookup(self, arrow_schema, pq_schema):
+        """
+        helper to create in internal lookup for the paths of the parquet columns
+        in a nested pyarrow.field structure
+        """
+        
+        def _iterate_nested_pq_fields(outer_generator, outer_args, outer_index = 0, path_name_src = "path"):
+            import pyarrow.parquet as pq
+            toplevel_dict = dict()
+            max_depth_index = outer_index
+            to_reduce = None
+            insert_index = None
+            toplevel_dict["generator"] = outer_generator
+            toplevel_dict["args"] = outer_args
+            substructure = None
+                
+            if isinstance(outer_args, tuple):
+                if len(outer_args) > 1:
+                    insert_index = 1
+                elif len(outer_args) == 1:
+                    insert_index = 0
+                to_reduce = outer_args[insert_index]
+            else:
+                to_reduce = outer_args
+
+            if isinstance(to_reduce, list):
+                # if substructure consists of a list, also create
+                # a list of dictionaries
+                substructure = list()
+
+                for i in range(len(to_reduce)):
+                    name = "item"
+                    try:
+                        name = to_reduce[i].name
+                        generator, args = to_reduce[i].__reduce__()
+                        entry, max_depth_index = _iterate_nested_pq_fields(
+                            outer_generator=generator,
+                            outer_args=args,
+                            outer_index=outer_index+i,
+                            path_name_src=path_name_src
+                        )
+                        entry["name"] = name
+                    except:
+                        entry = to_reduce[i]
+                    
+                    substructure.append(entry)
+            else:
+                try:
+                    # if reduction is possible, there maybe a nested structure
+                    # so continue to go deeper
+                    generator, args = to_reduce.__reduce__()
+                    # after this point, the reduction is successful
+                    
+                    # if the substructe is a list, loop through the items                    
+                    # otherwise, just get the substructure directly
+                    substructure, max_depth_index = _iterate_nested_pq_fields(
+                        outer_generator=generator,
+                        outer_args=args,
+                        outer_index=outer_index,
+                        path_name_src=path_name_src
+                    )
+
+                except:
+                    # if no reduction is possible, we have reached the lowest level
+                    # try to load the path
+                    path = (path_name_src.column(outer_index).path 
+                            if isinstance(path_name_src, pq.ParquetSchema) 
+                            else path_name_src
+                        )
+                    return path, max_depth_index
+
+            if substructure and not isinstance(substructure, str):
+                toplevel_dict["substructure"] = substructure
+                if insert_index:
+                    toplevel_dict["insert_index"] = insert_index
+            elif isinstance(substructure, str):
+                toplevel_dict["path"] = substructure
+
+            return toplevel_dict, max_depth_index
+
+        lookup = {}
+        max_depth_index = 0
+        for i, field_name in enumerate(arrow_schema.names):
+            field = arrow_schema.field(i)
+            path_name_src = pq_schema if pq_schema else field_name
+            # a field can be reduced, so start with the reduction here
+            generator, args = field.__reduce__()
+            lookup[field_name], max_depth_index = _iterate_nested_pq_fields(
+                outer_generator=generator,
+                outer_args=args, 
+                outer_index=i+max_depth_index, 
+                path_name_src=path_name_src)
+        self.column_lookup = lookup
+
 
 class _ParquetFileDataset(_Dataset):
     def __init__(
@@ -3504,6 +3666,8 @@ class _ParquetFileDataset(_Dataset):
             row_groups = range(self._file.num_row_groups)
 
         schema = self._file.schema_arrow
+        from IPython import embed; embed()
+        self._create_column_path_lookup(arrow_schema=schema, pq_schema=self._file.schema)
         if columns is None:
             columns = schema.names
         schema = _partial_schema_from_columns(schema, columns)
@@ -3518,7 +3682,7 @@ class _ParquetFileDataset(_Dataset):
 
     def read_row_group(self, row_group, columns=None):
         if columns is None:
-            columns = self.columns
+            columns = self.columns_paths
 
         return self._file.read_row_group(
             row_group, columns=columns, use_threads=self._use_threads
@@ -3613,7 +3777,7 @@ class _ParquetDataset(_Dataset):
 
     def read_row_group(self, row_group, columns=None):
         if columns is None:
-            columns = self.columns
+            columns = self.columns_paths
 
         import pyarrow.parquet
 
@@ -3623,7 +3787,7 @@ class _ParquetDataset(_Dataset):
         return local_file.read_row_group(
             local_row_group, columns, use_threads=self._use_threads
         )
-
+        
 
 class _ParquetMultiFileDataset(_Dataset):
     def __init__(
@@ -3742,16 +3906,47 @@ def _parquet_partitions_to_awkward(paths_and_counts):
     return indexedarrays
 
 
-def _partial_schema_from_columns(schema, columns):
+def _partial_schema_from_columns(schema, columns, schema_pq=None):
+    def prepare_columns(columns):
+        """
+        helper to bring columns into a better format to build pyarrow fields
+        Converts 
+
+        [(Field1, column1), (Field1, column2), (Field2, column1),]
+
+        into
+
+        [(Field1, (column1, column2)), (Field2, (column1)),]
+        """
+        structured_columns = []
+        fields_and_columns = dict()
+        for c in columns:
+            # first check if the list elements are just strings
+            if isinstance(c, str):
+                structured_columns.append((c,()))
+            elif isinstance(c, tuple):
+                field = c[0]
+                col = c[1]
+                if not field in fields_and_columns:
+                    fields_and_columns[field] = {col}
+                else:
+                    fields_and_columns[field].add(col)
+
+        return [(f, tuple(fields_and_columns[f].values())) for f in fields_and_columns]
+
+    current_columns = prepare_columns(columns)
     pyarrow = _import_pyarrow("ak.from_parquet")
     pa_fields = []
-    for x in columns:
-        if x not in schema.names:
-            raise ValueError(
-                f"column {x!r} not found in schema"
-                + ak._util.exception_suffix(__file__)
-            )
-        pa_fields.append(schema.field(x))
+    for x in current_columns:
+        field = None
+        if not schema_pq:
+            if x not in schema.names:
+                raise ValueError(
+                    f"column {x!r} not found in schema"
+                    + ak._util.exception_suffix(__file__)
+                )
+            field = schema.field(x)
+        pa_fields.append(field)
     return pyarrow.schema(pa_fields)
 
 
