@@ -15,6 +15,7 @@ from collections.abc import Iterable, Sized
 from collections.abc import MutableMapping
 
 import awkward as ak
+from pyparsing import col
 
 np = ak.nplike.NumpyMetadata.instance()
 numpy = ak.nplike.Numpy.instance()
@@ -3470,6 +3471,8 @@ class _Dataset:
         self.columns = columns
         if isinstance(column_paths, list):
             self.column_paths = column_paths
+        else:
+            self.column_paths = self.columns
         self.partition_columns = partition_columns
         self.__lookup = dict()
 
@@ -3553,8 +3556,8 @@ class _Dataset:
 
     @column_lookup.setter
     def column_lookup(self, input_dict):
-        if not isinstance(input_dict, dict):
-            raise ValueError("column lookup table must be a dict!")
+        if not isinstance(input_dict, list):
+            raise ValueError("column lookup table must be a list of dicts!")
         self.__lookup = input_dict
 
     def _create_column_path_lookup(self, arrow_schema, pq_schema):
@@ -3637,18 +3640,20 @@ class _Dataset:
 
             return toplevel_dict, max_depth_index
 
-        lookup = {}
+        lookup = []
         max_depth_index = 0
         for i, field_name in enumerate(arrow_schema.names):
             field = arrow_schema.field(i)
             path_name_src = pq_schema if pq_schema else field_name
             # a field can be reduced, so start with the reduction here
             generator, args = field.__reduce__()
-            lookup[field_name], max_depth_index = _iterate_nested_pq_fields(
+            field_lookup, max_depth_index = _iterate_nested_pq_fields(
                 outer_generator=generator,
                 outer_args=args, 
                 outer_index=i+max_depth_index, 
                 path_name_src=path_name_src)
+            field_lookup["name"] = field_name
+            lookup.append(field_lookup)
         self.column_lookup = lookup
 
 
@@ -3666,15 +3671,14 @@ class _ParquetFileDataset(_Dataset):
             row_groups = range(self._file.num_row_groups)
 
         schema = self._file.schema_arrow
-        from IPython import embed; embed()
         self._create_column_path_lookup(arrow_schema=schema, pq_schema=self._file.schema)
         if columns is None:
             columns = schema.names
-        schema = _partial_schema_from_columns(schema, columns)
+        schema, column_paths = _partial_schema_from_columns(schema, columns, column_lookup=self.column_lookup)
 
         self._use_threads = use_threads
 
-        super().__init__(schema, row_groups, columns, partition_columns=[])
+        super().__init__(schema, row_groups, columns, partition_columns=[], column_paths=column_paths)
 
     @property
     def row_group_metadata(self):
@@ -3682,7 +3686,7 @@ class _ParquetFileDataset(_Dataset):
 
     def read_row_group(self, row_group, columns=None):
         if columns is None:
-            columns = self.columns_paths
+            columns = self.column_paths
 
         return self._file.read_row_group(
             row_group, columns=columns, use_threads=self._use_threads
@@ -3713,7 +3717,7 @@ class _ParquetDataset(_Dataset):
         schema = self._metadata_file.schema_arrow
         if columns is None:
             columns = schema.names
-        schema = _partial_schema_from_columns(schema, columns)
+        schema, column_paths = _partial_schema_from_columns(schema, columns)
 
         if include_partition_columns:
             paths_and_counts = self._get_paths_and_counts(
@@ -3727,7 +3731,7 @@ class _ParquetDataset(_Dataset):
         self._lookup = self._build_row_group_lookup(directory, self._metadata_file)
         self._options = options
 
-        super().__init__(schema, row_groups, columns, partition_columns)
+        super().__init__(schema, row_groups, columns, partition_columns, column_paths=column_paths)
 
     @staticmethod
     def _build_row_group_lookup(directory, metadata_file):
@@ -3777,7 +3781,7 @@ class _ParquetDataset(_Dataset):
 
     def read_row_group(self, row_group, columns=None):
         if columns is None:
-            columns = self.columns_paths
+            columns = self.column_paths
 
         import pyarrow.parquet
 
@@ -3813,11 +3817,11 @@ class _ParquetMultiFileDataset(_Dataset):
 
         if columns is None:
             columns = schema.names
-        schema = _partial_schema_from_columns(schema, columns)
+        schema, column_paths = _partial_schema_from_columns(schema, columns)
 
         self._lookup = lookup
         self._use_threads = use_threads
-        super().__init__(schema, row_groups, columns, partition_columns)
+        super().__init__(schema, row_groups, columns, partition_columns, column_paths=column_paths)
 
     @staticmethod
     def _get_dataset_metadata(source, relative_to, options):
@@ -3906,48 +3910,175 @@ def _parquet_partitions_to_awkward(paths_and_counts):
     return indexedarrays
 
 
-def _partial_schema_from_columns(schema, columns, schema_pq=None):
-    def prepare_columns(columns):
-        """
-        helper to bring columns into a better format to build pyarrow fields
-        Converts 
+def _partial_schema_from_columns(schema, columns, column_lookup=None):
 
-        [(Field1, column1), (Field1, column2), (Field2, column1),]
+    def _recursive_copy(name, column_tuple_iterator, column_cache, column_lookup, reached_lowest_layer):
+        column_paths = set()
+        # first get keys that are to be copied
+        keys = column_lookup.keys()
 
-        into
+        # if there is no substructure, something is wrong and abort
+        if not "substructure" in keys:
+            raise NotImplementedError("Couldn't find substructure!")
+        # remove substructure
+        keys.pop(keys.index("substructure"))
 
-        [(Field1, (column1, column2)), (Field2, (column1)),]
-        """
-        structured_columns = []
-        fields_and_columns = dict()
-        for c in columns:
-            # first check if the list elements are just strings
-            if isinstance(c, str):
-                structured_columns.append((c,()))
-            elif isinstance(c, tuple):
-                field = c[0]
-                col = c[1]
-                if not field in fields_and_columns:
-                    fields_and_columns[field] = {col}
+        # copy structure
+        for k in keys:
+            # if the key is already in this level of the column cache, 
+            # make a sanity check but don't copy anything
+            if k in column_cache:
+                if not column_cache[k] == column_lookup[k]:
+                    raise ValueError("Found mismatch between column cache and lookup!")
+            else:
+                column_cache[k] = column_lookup[k]
+        
+        substruct = column_lookup["substructure"]
+        
+        substruct_copy = None
+        if isinstance(substruct, list):
+            if not "substructure" in column_cache:
+                column_cache["substructure"] = type(substruct)()
+            for i, item in enumerate(substruct):
+                if not item in column_cache["substructure"]:
+                    substruct_copy, column_paths, reached_lowest_layer = _collect_column_information(
+                        name, 
+                        column_tuple_iterator=column_tuple_iterator,
+                        column_lookup=item,
+                        reached_lowest_layer=reached_lowest_layer
+                    )
+                    if substruct_copy:
+                        column_cache["substructure"].append(substruct_copy)
                 else:
-                    fields_and_columns[field].add(col)
+                    substruct_copy, column_paths, reached_lowest_layer = _collect_column_information(
+                        name, 
+                        column_tuple_iterator=column_tuple_iterator,
+                        column_lookup=item,
+                        column_cache=column_cache[column_cache.index(item)],
+                        reached_lowest_layer=reached_lowest_layer
+                    )
+                    
+        elif isinstance(substruct, dict):
+            if "substructure" in column_cache:
+                if not column_cache[k] == substruct:
+                    raise ValueError("Found mismatch between column cache and lookup!")
+            else:
+                substruct_copy, column_paths, reached_lowest_layer = _collect_column_information(
+                        name,
+                        column_tuple_iterator=column_tuple_iterator,
+                        column_lookup=substruct,
+                        reached_lowest_layer=reached_lowest_layer
+                    )
+                if substruct_copy:
+                    column_cache["substructure"] = substruct_copy
+        else:
+            raise NotImplementedError("Can only read substructure from dicts or lists!")
 
-        return [(f, tuple(fields_and_columns[f].values())) for f in fields_and_columns]
+        return column_cache, column_paths, reached_lowest_layer
+                
+    def _collect_column_information(name, column_tuple_iterator, column_lookup, column_cache = None, reached_lowest_layer=False):
+        if column_cache is None:
+            column_cache = type(column_lookup)()
+        column_paths = set()
+        if reached_lowest_layer == None:
+            column_tuple_iterator.__next__()
+        # iterate through column parts
+        while not reached_lowest_layer:
+            
+            # check if we're already at the lowest level
+            # if yes, we have expected a deeper structure but there is none
+            # so raise an error
+            # from IPython import embed; embed()
 
-    current_columns = prepare_columns(columns)
+            column_name_from_lt = column_lookup.get("name")
+            if not column_name_from_lt:
+                # if there is no property 'name', we have to go deeper 
+                # into the lookup table. Also, update the structure in the 
+                # column cache
+                
+                column_cache, column_paths, reached_lowest_layer = _recursive_copy(
+                    name, 
+                    column_tuple_iterator, 
+                    column_cache, 
+                    column_lookup,
+                    reached_lowest_layer
+                )
+                
+            else:
+                if not name == column_name_from_lt:
+                    return None, None
+                else:
+                    try:
+                        # if the names match and this is not the final 
+                        # layer of the iterator, copy and keep going
+                        name = column_tuple_iterator.__next__()
+                        column_cache, column_paths = _recursive_copy(
+                            name,
+                            column_tuple_iterator, 
+                            column_cache, 
+                            column_lookup
+                        )
+                    # if there is nothing left in the iterator, we are done
+                    except StopIteration:
+                        reached_lowest_layer = True
+                        break
+
+        # we're out of the column iteration loop here, so check for a path
+        # or a substructure (WIP)
+        path = column_lookup.get("path")
+        if(path):
+            column_paths.add(path)
+        return column_cache, column_paths, reached_lowest_layer
+
     pyarrow = _import_pyarrow("ak.from_parquet")
     pa_fields = []
-    for x in current_columns:
-        field = None
-        if not schema_pq:
+    column_paths = set()
+    column_cache = dict()
+    for x in columns:
+        if isinstance(x, str) and not column_lookup:
+            # keep old awkward array implementation as backup for now
             if x not in schema.names:
                 raise ValueError(
                     f"column {x!r} not found in schema"
                     + ak._util.exception_suffix(__file__)
                 )
             field = schema.field(x)
-        pa_fields.append(field)
-    return pyarrow.schema(pa_fields)
+            pa_fields.append(field)
+            column_paths.add(x)
+        elif isinstance(x, str):
+            # if the column name is just a string, it must be a top-level
+            # field in the parquet file, so just look through the top-level
+            # keys of the lookup
+            for lookup in column_lookup:
+                field = lookup.get(x)
+                if field: break
+            if not field:
+                raise ValueError(
+                    f"column {x!r} not found in schema"
+                    + ak._util.exception_suffix(__file__)
+                )
+            pa_fields.append(field["generator"](*field["args"]))
+            column_paths.add(x)
+        elif isinstance(x, Iterable) and all(isinstance(e, str) for e in x):
+            for lookup in column_lookup:
+                try:
+
+                    column_cache, current_paths, reached_lowest_layer = _collect_column_information(
+                        column_tuple_iterator=x.__iter__(),
+                        column_lookup=lookup,
+                        column_cache=column_cache,
+                        reached_lowest_layer=None,
+                    )
+                    column_paths.update(current_paths)
+                except:
+                    from IPython import embed; embed()
+
+        else:
+            raise NotImplementedError(
+                f"Could not infer pyarrow.schema from column names with typ '{type(x)}'"
+                + ak._util.exception_suffix(__file__)
+            )
+    return pyarrow.schema(pa_fields), list(column_paths)
 
 
 def _create_partitioned_array_from_form(
@@ -4144,7 +4275,7 @@ def from_parquet(
 
     else:
         dataset = _ParquetFileDataset(source, row_groups, columns, use_threads, options)
-
+    from IPython import embed; embed()
     if dataset.is_empty:
         return ak.layout.RecordArray(
             [ak.layout.EmptyArray() for _ in dataset.columns], dataset.columns, 0
