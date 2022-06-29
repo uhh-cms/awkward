@@ -15,7 +15,6 @@ from collections.abc import Iterable, Sized
 from collections.abc import MutableMapping
 
 import awkward as ak
-from pyparsing import col
 
 np = ak.nplike.NumpyMetadata.instance()
 numpy = ak.nplike.Numpy.instance()
@@ -3912,10 +3911,12 @@ def _parquet_partitions_to_awkward(paths_and_counts):
 
 def _partial_schema_from_columns(schema, columns, column_lookup=None):
 
-    def _recursive_copy(name, column_tuple_iterator, column_cache, column_lookup, reached_lowest_layer):
+    def _recursive_copy(name, column_tuple_iterator, column_lookup, reached_lowest_layer, column_cache = None):
+        if not column_cache:
+            column_cache = type(column_lookup)()
         column_paths = set()
         # first get keys that are to be copied
-        keys = column_lookup.keys()
+        keys = list(column_lookup.keys())
 
         # if there is no substructure, something is wrong and abort
         if not "substructure" in keys:
@@ -3945,10 +3946,12 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
                         name, 
                         column_tuple_iterator=column_tuple_iterator,
                         column_lookup=item,
+                        column_cache=None,
                         reached_lowest_layer=reached_lowest_layer
                     )
                     if substruct_copy:
                         column_cache["substructure"].append(substruct_copy)
+                    
                 else:
                     substruct_copy, column_paths, reached_lowest_layer = _collect_column_information(
                         name, 
@@ -3957,6 +3960,9 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
                         column_cache=column_cache[column_cache.index(item)],
                         reached_lowest_layer=reached_lowest_layer
                     )
+                if column_paths and not len(column_paths) == 0:
+                    # we found a path, no need to go deeper
+                    break
                     
         elif isinstance(substruct, dict):
             if "substructure" in column_cache:
@@ -3967,10 +3973,12 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
                         name,
                         column_tuple_iterator=column_tuple_iterator,
                         column_lookup=substruct,
+                        column_cache=None,
                         reached_lowest_layer=reached_lowest_layer
                     )
                 if substruct_copy:
                     column_cache["substructure"] = substruct_copy
+
         else:
             raise NotImplementedError("Can only read substructure from dicts or lists!")
 
@@ -3981,7 +3989,8 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
             column_cache = type(column_lookup)()
         column_paths = set()
         if reached_lowest_layer == None:
-            column_tuple_iterator.__next__()
+            name = column_tuple_iterator.__next__()
+            reached_lowest_layer = False
         # iterate through column parts
         while not reached_lowest_layer:
             
@@ -3997,43 +4006,48 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
                 # column cache
                 
                 column_cache, column_paths, reached_lowest_layer = _recursive_copy(
-                    name, 
-                    column_tuple_iterator, 
-                    column_cache, 
-                    column_lookup,
-                    reached_lowest_layer
+                    name=name, 
+                    column_tuple_iterator=column_tuple_iterator, 
+                    column_cache=column_cache, 
+                    column_lookup=column_lookup,
+                    reached_lowest_layer=reached_lowest_layer,
                 )
                 
             else:
                 if not name == column_name_from_lt:
-                    return None, None
+                    return None, None, reached_lowest_layer
                 else:
                     try:
                         # if the names match and this is not the final 
                         # layer of the iterator, copy and keep going
                         name = column_tuple_iterator.__next__()
-                        column_cache, column_paths = _recursive_copy(
-                            name,
-                            column_tuple_iterator, 
-                            column_cache, 
-                            column_lookup
+                        column_cache, column_paths, reached_lowest_layer = _recursive_copy(
+                            name=name, 
+                            column_tuple_iterator=column_tuple_iterator, 
+                            column_cache=column_cache, 
+                            column_lookup=column_lookup,
+                            reached_lowest_layer=reached_lowest_layer,
                         )
                     # if there is nothing left in the iterator, we are done
                     except StopIteration:
                         reached_lowest_layer = True
+                        # print("stopped iterator, starting IPython")
+                        # from IPython import embed; embed()
                         break
-
-        # we're out of the column iteration loop here, so check for a path
-        # or a substructure (WIP)
-        path = column_lookup.get("path")
-        if(path):
-            column_paths.add(path)
+        if len(column_cache) == 0:
+            column_cache = column_lookup
+        if len(column_paths) == 0:
+            # we're out of the column iteration loop here, so check for a path
+            # or a substructure (WIP)
+            path = column_lookup.get("path")
+            if(path):
+                column_paths.add(path)
         return column_cache, column_paths, reached_lowest_layer
 
     pyarrow = _import_pyarrow("ak.from_parquet")
     pa_fields = []
     column_paths = set()
-    column_cache = dict()
+    column_cache = list()
     for x in columns:
         if isinstance(x, str) and not column_lookup:
             # keep old awkward array implementation as backup for now
@@ -4049,30 +4063,44 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
             # if the column name is just a string, it must be a top-level
             # field in the parquet file, so just look through the top-level
             # keys of the lookup
+            field_lookup = None
             for lookup in column_lookup:
-                field = lookup.get(x)
-                if field: break
-            if not field:
+                field = lookup.get("name")
+                if field == x: 
+                    field_lookup = lookup
+                    break
+            if not field_lookup:
                 raise ValueError(
                     f"column {x!r} not found in schema"
                     + ak._util.exception_suffix(__file__)
                 )
-            pa_fields.append(field["generator"](*field["args"]))
+            pa_fields.append(field_lookup["generator"](*field_lookup["args"]))
             column_paths.add(x)
-        elif isinstance(x, Iterable) and all(isinstance(e, str) for e in x):
+        elif isinstance(x, Iterable) and all(isinstance(ele, str) for ele in x):
             for lookup in column_lookup:
-                try:
-
-                    column_cache, current_paths, reached_lowest_layer = _collect_column_information(
-                        column_tuple_iterator=x.__iter__(),
-                        column_lookup=lookup,
-                        column_cache=column_cache,
-                        reached_lowest_layer=None,
-                    )
+                current_cache_idx = None
+                # if there is already a cache, try to find the correct top-level
+                # field. If there is one, we want to add to it. If not, we must
+                # create a completely new entry in the column cache
+                for i, cache in enumerate(column_cache):
+                    # compare top-level field names
+                    cache_name = cache.get("name")
+                    if cache_name == x[0]:
+                        current_cache_idx = i
+                        break
+                current_cache, current_paths, _ = _collect_column_information(
+                    name = "",
+                    column_tuple_iterator=x.__iter__(),
+                    column_lookup=lookup,
+                    column_cache=column_cache[current_cache_idx] if current_cache_idx else None,
+                    reached_lowest_layer=None,
+                )
+                if isinstance(current_paths, Iterable) and len(current_paths) > 0:
                     column_paths.update(current_paths)
-                except:
-                    from IPython import embed; embed()
-
+                if not current_cache_idx and isinstance(current_cache, dict):
+                    column_cache.append(current_cache)
+            print("loaded all columns, starting debug shell")
+            from IPython import embed; embed()
         else:
             raise NotImplementedError(
                 f"Could not infer pyarrow.schema from column names with typ '{type(x)}'"
