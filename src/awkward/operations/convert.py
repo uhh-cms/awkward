@@ -2639,6 +2639,8 @@ def _from_arrow(
     pyarrow = _import_pyarrow("ak.from_arrow")
 
     def popbuffers(array, tpe, buffers):
+        print("in _from_arrow.popbuffers")
+        from IPython import embed; embed()
         if isinstance(tpe, pyarrow.lib.DictionaryType):
             index = popbuffers(array.indices, tpe.index_type, buffers)
             content = handle_arrow(array.dictionary)
@@ -2885,6 +2887,8 @@ def _from_arrow(
             return out[array.offset : array.offset + len(array)]
 
     def handle_arrow(obj):
+        print("in _from_arrow.handle_arrow")
+        from IPython import embed; embed()
         if isinstance(obj, pyarrow.lib.Array):
             buffers = obj.buffers()
             out = popbuffers(obj, obj.type, buffers)
@@ -3473,7 +3477,11 @@ class _Dataset:
         else:
             self.column_paths = self.columns
         self.partition_columns = partition_columns
-        self.__lookup = dict()
+        try:
+            if len(self.__lookup) == 0:
+                self.__lookup = dict()
+        except:
+            self.__lookup = dict()
 
     @property
     def is_empty(self):
@@ -3965,19 +3973,16 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
                     break
                     
         elif isinstance(substruct, dict):
-            if "substructure" in column_cache:
-                if not column_cache[k] == substruct:
-                    raise ValueError("Found mismatch between column cache and lookup!")
-            else:
-                substruct_copy, column_paths, reached_lowest_layer = _collect_column_information(
-                        name,
-                        column_tuple_iterator=column_tuple_iterator,
-                        column_lookup=substruct,
-                        column_cache=None,
-                        reached_lowest_layer=reached_lowest_layer
-                    )
-                if substruct_copy:
-                    column_cache["substructure"] = substruct_copy
+            
+            substruct_copy, column_paths, reached_lowest_layer = _collect_column_information(
+                    name,
+                    column_tuple_iterator=column_tuple_iterator,
+                    column_lookup=substruct,
+                    column_cache=column_cache.get("substructure"),
+                    reached_lowest_layer=reached_lowest_layer
+                )
+            if substruct_copy and not "substructure" in column_cache:
+                column_cache["substructure"] = substruct_copy
 
         else:
             raise NotImplementedError("Can only read substructure from dicts or lists!")
@@ -3985,6 +3990,7 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
         return column_cache, column_paths, reached_lowest_layer
                 
     def _collect_column_information(name, column_tuple_iterator, column_lookup, column_cache = None, reached_lowest_layer=False):
+
         if column_cache is None:
             column_cache = type(column_lookup)()
         column_paths = set()
@@ -4044,6 +4050,32 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
                 column_paths.add(path)
         return column_cache, column_paths, reached_lowest_layer
 
+    def _construct_schema_from_lookup(lookup):
+        generator = lookup["generator"]
+        args = lookup["args"]
+        insert_index = lookup.get("insert_index")
+        substructure = lookup.get("substructure")
+
+        if isinstance(substructure, list):
+            substruct_args = list()
+            for item in substructure:
+                substruct_args.append(_construct_schema_from_lookup(item))
+        elif isinstance(substructure, dict):
+            substruct_args = _construct_schema_from_lookup(substructure)
+        elif substructure == None:
+            substruct_args = args
+
+        if not any(insert_index == x for x in [None, 0]):
+            final_args = (*args[:insert_index], substruct_args, *args[insert_index+1:])
+        else:
+            final_args = substruct_args if type(substruct_args) == tuple else (substruct_args,)
+        
+        # print("in _construct_schema_from_lookup")
+        # from IPython import embed; embed()
+        return generator(*final_args)
+
+
+
     pyarrow = _import_pyarrow("ak.from_parquet")
     pa_fields = []
     column_paths = set()
@@ -4092,20 +4124,27 @@ def _partial_schema_from_columns(schema, columns, column_lookup=None):
                     name = "",
                     column_tuple_iterator=x.__iter__(),
                     column_lookup=lookup,
-                    column_cache=column_cache[current_cache_idx] if current_cache_idx else None,
+                    column_cache=(column_cache[current_cache_idx] 
+                                    if not current_cache_idx == None 
+                                    else None
+                                ),
                     reached_lowest_layer=None,
                 )
                 if isinstance(current_paths, Iterable) and len(current_paths) > 0:
                     column_paths.update(current_paths)
-                if not current_cache_idx and isinstance(current_cache, dict):
+                if current_cache_idx == None and isinstance(current_cache, dict):
                     column_cache.append(current_cache)
-            print("loaded all columns, starting debug shell")
-            from IPython import embed; embed()
         else:
             raise NotImplementedError(
                 f"Could not infer pyarrow.schema from column names with typ '{type(x)}'"
                 + ak._util.exception_suffix(__file__)
             )
+    if len(pa_fields) == 0 and len(column_cache) > 0:
+        # print("constructing pa_fields")
+        # from IPython import embed; embed()
+        pa_fields = [_construct_schema_from_lookup(cache) for cache in column_cache]
+        # print("loaded all columns, starting debug shell")
+        # from IPython import embed; embed()
     return pyarrow.schema(pa_fields), list(column_paths)
 
 
