@@ -2639,8 +2639,6 @@ def _from_arrow(
     pyarrow = _import_pyarrow("ak.from_arrow")
 
     def popbuffers(array, tpe, buffers):
-        print("in _from_arrow.popbuffers")
-        from IPython import embed; embed()
         if isinstance(tpe, pyarrow.lib.DictionaryType):
             index = popbuffers(array.indices, tpe.index_type, buffers)
             content = handle_arrow(array.dictionary)
@@ -2887,8 +2885,6 @@ def _from_arrow(
             return out[array.offset : array.offset + len(array)]
 
     def handle_arrow(obj):
-        print("in _from_arrow.handle_arrow")
-        from IPython import embed; embed()
         if isinstance(obj, pyarrow.lib.Array):
             buffers = obj.buffers()
             out = popbuffers(obj, obj.type, buffers)
@@ -4342,7 +4338,6 @@ def from_parquet(
 
     else:
         dataset = _ParquetFileDataset(source, row_groups, columns, use_threads, options)
-    from IPython import embed; embed()
     if dataset.is_empty:
         return ak.layout.RecordArray(
             [ak.layout.EmptyArray() for _ in dataset.columns], dataset.columns, 0
